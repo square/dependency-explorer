@@ -1,0 +1,14 @@
+pluginManagement {
+  repositories {
+    mavenCentral()
+    maven { url "https://plugins.gradle.org/m2/" }
+  }
+  plugins {
+    id 'org.jetbrains.kotlin.jvm' version "1.7.20"
+    id 'org.jetbrains.kotlin.kapt' version "1.7.20"
+    id 'org.jetbrains.kotlin.plugin.serialization' version "1.7.20"
+    id 'com.github.johnrengelman.shadow' version "7.1.2"
+  }
+}
+rootProject.name = 'app'
+

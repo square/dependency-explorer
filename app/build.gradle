@@ -1,0 +1,199 @@
+//file:noinspection GrUnresolvedAccess
+//file:noinspection GroovyAssignabilityCheck
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+import org.gradle.internal.jvm.Jvm
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
+import proguard.gradle.ProGuardTask
+
+buildscript {
+    dependencies {
+        classpath 'com.guardsquare:proguard-gradle:7.2.2'
+    }
+}
+
+plugins {
+    id 'org.jetbrains.kotlin.jvm' version '1.7.20'
+    id 'org.jetbrains.kotlin.plugin.serialization'
+    id 'application'
+    id 'com.github.johnrengelman.shadow'
+}
+
+group = 'com.squareup'
+version = '1.0.0'
+ext.projectName = 'dependency-explorer'
+
+repositories {
+    mavenCentral()
+}
+
+application {
+    mainClass.set('com.setup.ide.MainKt')
+}
+
+configurations {
+    proguard
+}
+
+dependencies {
+    implementation libs.koin
+    implementation libs.kotlin.serialization
+    implementation libs.picocli.core
+    implementation libs.slf4j.simple
+
+    testImplementation libs.junit5.api
+    testImplementation libs.junit5.engine
+    testImplementation libs.truth
+}
+
+def javaVersion = JavaVersion.VERSION_11
+java {
+    sourceCompatibility = javaVersion
+    targetCompatibility = javaVersion
+}
+
+tasks.withType(KotlinCompile).configureEach {
+    kotlinOptions {
+        jvmTarget = javaVersion
+        allWarningsAsErrors = false
+    }
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+}
+
+// Copy distribution files needed for tests into build/resources/test
+tasks.named('processTestResources', ProcessResources) {
+    from 'src/dist'
+}
+
+ext.baseCoordinates = "${projectName}-${project.version}"
+
+def shadowJar = tasks.named('shadowJar', ShadowJar) {
+    doNotTrackState(
+        """\
+      The jar remains up to date even when changing the excludes.
+      See also https://github.com/johnrengelman/shadow/issues/62#issuecomment-877728948
+      """.stripIndent()
+    )
+
+    group = 'Build'
+    description = 'Produces a fat jar'
+    archiveFileName = "${baseCoordinates}-all.jar"
+    reproducibleFileOrder = true
+
+    from sourceSets.main.output
+    from project.configurations.runtimeClasspath
+
+    exclude '**/*.kotlin_metadata'
+    exclude '**/*.kotlin_module'
+    exclude 'META-INF/maven/**'
+}
+
+ext.packageFilters = [
+        "!**META-INF/versions/**.class"
+].join(',')
+
+def minify = tasks.register('minify', ProGuardTask) {
+    notCompatibleWithConfigurationCache('See https://github.com/johnrengelman/shadow/issues/763')
+    configuration file('proguard.pro')
+
+    // injars: the classpath that must be processed
+    injars(filter: packageFilters, shadowJar.flatMap { it.archiveFile })
+    // libraryjars: on the classpath but not to be processed (i.e., the JDK)
+    libraryjars(javaRuntime() + configurations.proguard)
+
+    // the minified jar output
+    outjars(layout.buildDirectory.file("libs/${baseCoordinates}-minified.jar"))
+
+    //libraryjars(filter: '!**META-INF/versions/**.class', configurations.compileClasspath)
+}
+
+// This is a sanity check. You can execute `./gradlew runMin [--args="arg..."]` to verify that the
+// minified binary works.
+tasks.register('runMin', JavaExec) {
+    classpath = files(minify)
+}
+
+tasks.withType(Test).configureEach {
+    // print out results on the command line
+    testLogging {
+        events 'passed', 'skipped', 'failed', 'standardOut', 'standardError'
+    }
+}
+
+tasks.withType(JavaExec).configureEach {
+    // set all the gradlew runs to debug.
+    setAllJvmArgs(getAllJvmArgs() + ["-Dorg.slf4j.simpleLogger.defaultLogLevel=DEBUG"])
+    notCompatibleWithConfigurationCache('Uses java.io.PipedInputStream at execution time')
+}
+
+tasks.withType(CreateStartScripts).configureEach {
+    applicationName = projectName
+    mainClass.set(application.mainClass)
+}
+
+def startShadowScripts = tasks.named('startShadowScripts', CreateStartScripts) {
+    classpath = files(minify)
+}
+
+def minifiedDistZip = tasks.register('minifiedDistZip', Zip) { zipTask ->
+    def zipRoot = "/${baseCoordinates}"
+    zipTask.archiveBaseName.set(projectName)
+    zipTask.archiveClassifier.set('minified')
+    //zipTask.archiveClassifier.set('minified')
+
+    // jar
+    zipTask.from(minify) {
+        into("$zipRoot/lib")
+    }
+
+    // bash script
+    zipTask.from(startShadowScripts).exclude {
+        // Skipping Windows script because who cares
+        it.name.endsWith('.bat')
+    }.into("$zipRoot/bin")
+
+    // raw files
+    zipTask.from('src/dist') {
+        into(zipRoot)
+    }
+}
+
+// This will unzip minifiedDistZip into a new directory, `binary`, in this project. That directory
+// should be checked in with git lfs and then a symlink created in the register root pointing to the
+// bash script at binary/bin/setupIdeModules.
+// nb: this unzips the previously created zip, but the two tasks are logically separate and each has
+// their own valid use-case, so we suffer the very tiny performance hit to zip and then immediately
+// unzip.
+tasks.register('buildBinary', Sync) {
+    dependsOn minifiedDistZip
+
+    from(zipTree(minifiedDistZip.flatMap { it.archiveFile })) {
+        // drop the dependency-explorer-1.0/ directory prefix
+        eachFile { fcd ->
+            fcd.relativePath = new RelativePath(true, fcd.relativePath.segments.drop(1))
+        }
+        includeEmptyDirs = false
+    }
+    into layout.projectDirectory.dir('binary')
+}
+
+/**
+ * @return The JDK, for use by Proguard.
+ */
+static List<File> javaRuntime() {
+    Jvm jvm = Jvm.current()
+    FilenameFilter filter = { _, fileName -> fileName.endsWith(".jar") || fileName.endsWith(".jmod") }
+
+    return ['jmods' /* JDK 9+ */, 'bundle/Classes' /* mac */, 'jre/lib' /* linux */]
+        .collect { new File(jvm.javaHome, it) }
+        .findAll { it.exists() }
+        .collectMany { it.listFiles(filter) as List }
+        .toSorted()
+        .tap {
+            if (isEmpty()) {
+                throw new IllegalStateException("Could not find JDK ${jvm.javaVersion.majorVersion} runtime")
+            }
+        }
+}
