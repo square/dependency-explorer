@@ -38,7 +38,7 @@ Development
 
 Production
  ```
- ./binary/bin/dependency-explorer gradle-projects apps/spos/app
+ ./run apps/spos/app
  ```
 
 Output
