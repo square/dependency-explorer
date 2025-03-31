@@ -58,6 +58,13 @@ class GradleModulesCommand(
   )
   lateinit var output: String
 
+  @Option(
+    names = ["--default-modules-file"],
+    description = ["Path to a file containing a list of default modules, one per line. (Optional)" +
+            "These modules will be included in the output file. Include them via the `include` function."]
+  )
+  var defaultModulesFile: Path? = null
+
   @Parameters(
     description = ["The gradle projects to collect dependencies for. (REQUIRED)"],
   )
@@ -66,22 +73,33 @@ class GradleModulesCommand(
   override fun call(): Path? {
     if (shouldEarlyExit()) return null
 
-    val gradleProjects = inputProjects
+    val defaultModulesFromFile = defaultModulesFile
+      ?.takeIf { it.exists() }
+      ?.toFile()
+      ?.readLines()
+      ?.map { it.trim() }
+      ?.filter { it.isNotEmpty() }
+      ?: emptyList()
+
+    val allInputModules = (inputProjects + defaultModulesFromFile)
       .map { it.toNormalizedGradleName() }
+      .distinct()
       .map { it.convertToGradleProject() }
       .toSet()
 
     println("Collecting module dependencies for inputs " +
-      gradleProjects.joinToString(", ") { it.gradlePath })
+            allInputModules.joinToString(", ") { it.gradlePath })
 
-    val expandedProjects = expandProjects.expand(gradleProjects)
-    val allDependencies = findDependencies.getAllTransitiveDependencies(expandedProjects)
+    val expandedProjects = expandProjects.expand(allInputModules)
+    val allDependencies = findDependencies.getAllTransitiveDependencies(expandedProjects).toMutableSet()
+    allDependencies.addAll(expandedProjects)
+
 
     println("Importing ${allDependencies.count()} total modules")
 
     val output = writeProjects.write(
       to = repo.resolve(output),
-      targets = inputProjects,
+      targets = allInputModules.map { it.gradlePath },
       projects = allDependencies.map { it.gradlePath }.toSet()
     )
 
